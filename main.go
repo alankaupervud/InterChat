@@ -16,9 +16,12 @@ import (
 
 const configPath = "config.json"
 
+//	type Config struct {
+
 type Config struct {
-	DiscordChannelID string `json:"discord_channel_id"`
-	TelegramChatID   int64  `json:"telegram_chat_id"`
+	DiscordChannelID string            `json:"discord_channel_id"`
+	TelegramChatID   int64             `json:"telegram_chat_id"`
+	UserMap          map[string]string `json:"user_map"`
 }
 
 var (
@@ -111,42 +114,53 @@ func main() {
 	dg.Identify.Intents = discordgo.IntentsGuildMessages |
 		discordgo.IntentsMessageContent
 
-	// Discord -> Telegram handler
+
 	dg.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
 		if m.Author.Bot {
 			return
 		}
-		PrintUserNames(s, m) // new add 18:30
 
-		content := strings.TrimSpace(m.Content)
+		// 1) Считаем displayName
+		username := m.Author.Username
+		globalName := m.Author.GlobalName
 
-		// /syn command
-		if strings.HasPrefix(strings.ToLower(content), "/syn") {
-			configMu.Lock()
-			config.DiscordChannelID = m.ChannelID
-			configMu.Unlock()
-			if err := saveConfig(); err != nil {
-				s.ChannelMessageSend(m.ChannelID, "Error saving configuration.")
-				return
-			}
-			s.ChannelMessageSend(m.ChannelID, "✅ Discord channel registered: "+m.ChannelID)
-			return
+		member, err := s.GuildMember(m.GuildID, m.Author.ID)
+		var nickname string
+		if err == nil {
+			nickname = member.Nick
 		}
 
-		// Forward after registration
-		configMu.Lock()
-		dCh := config.DiscordChannelID
-		tCh := config.TelegramChatID
-		configMu.Unlock()
+		displayName := nickname
+		if displayName == "" {
+			displayName = globalName
+		}
+		if displayName == "" {
+			displayName = username
+		}
 
-		if dCh != "" && tCh != 0 && m.ChannelID == dCh {
-			raw := "**" + m.Author.Username + "** 	: " + content
-			msg := tgbotapi.NewMessage(tCh, raw)
-			if _, err := tgBot.Send(msg); err != nil {
-				log.Printf("Error sending to Telegram: %v", err)
-			} else {
-				log.Printf("→ TG: %s", raw)
-			}
+		// 2) Ищем в map telegram‑никнейм
+		configMu.Lock()
+		tgNick, ok := config.UserMap[displayName]
+		configMu.Unlock()
+		if !ok {
+			// если нет в мапе, можно вернуть какой‑то дефолт или оставить пустым
+			tgNick = ""
+		}
+
+		// 3) Формируем текст с добавлением @telegramnickname (если есть)
+		content := strings.TrimSpace(m.Content)
+		raw := "**" + displayName + "**: " + content
+		if tgNick != "" {
+			raw = tgNick + "  " + raw
+		}
+
+		// 4) Отправляем в Telegram
+		msg := tgbotapi.NewMessage(config.TelegramChatID, raw)
+		// убрали ParseMode, чтобы не ломались сообщения
+		if _, err := tgBot.Send(msg); err != nil {
+			log.Printf("Error sending to Telegram: %v", err)
+		} else {
+			log.Printf("→ TG: %s", raw)
 		}
 	})
 
