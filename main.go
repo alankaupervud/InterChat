@@ -111,7 +111,7 @@ func main() {
 		if dCh != "" && tCh != 0 && m.ChannelID == dCh {
 			text := "**" + m.Author.Username + "**: " + m.Content
 			msg := tgbotapi.NewMessage(tCh, text)
-			msg.ParseMode = "Markdown"
+			//msg.ParseMode = "Markdown"
 			if _, err := tgBot.Send(msg); err != nil {
 				log.Printf("Ошибка отправки в Telegram: %v", err)
 			}
