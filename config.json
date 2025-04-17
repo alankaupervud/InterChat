@@ -1,4 +1,9 @@
 {
   "discord_channel_id": "",
-  "telegram_chat_id": 0
+  "telegram_chat_id": 0,
+  "user_map": {
+    "Name Surname ": "@NicknameExample",
+    "Name Surname ": "@NicknameExample",
+    "Name Surname ": "@NicknameExample"
+  }
 }
