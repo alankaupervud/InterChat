@@ -5,21 +5,22 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/bwmarrin/discordgo"
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
 )
 
 const configPath = "config.json"
 
+// Config stored on disk
 type Config struct {
-	DiscordChannelID string            `json:"discord_channel_id"`
-	TelegramChatID   int64             `json:"telegram_chat_id"`
-	UserMap          map[string]string `json:"user_map"`
+	DiscordChannelID string `json:"discord_channel_id"`
+	TelegramChatID   int64  `json:"telegram_chat_id"`
+	// map[DiscordDisplay] = "@telegramHandle"
+	UserMap map[string]string `json:"user_map"`
 }
 
 type MessageRef struct {
@@ -30,11 +31,14 @@ type MessageRef struct {
 var (
 	config              Config
 	configMu            sync.Mutex
-	discordToTelegram   = make(map[string]int)
-	telegramToDiscord   = make(map[string]MessageRef)
+	discordToTelegram   = make(map[string]int)     // key "<channelID>:<discordMsgID>" → TG msgID
+	telegramToDiscord   = make(map[int]MessageRef) // key TG msgID → Discord ref
 	bridgeMappingsMutex sync.Mutex
 )
 
+// --------------------------------------------------
+// helpers
+// --------------------------------------------------
 func loadConfig() error {
 	data, err := ioutil.ReadFile(configPath)
 	if err != nil {
@@ -55,6 +59,9 @@ func saveConfig() error {
 	return ioutil.WriteFile(configPath, data, 0644)
 }
 
+// --------------------------------------------------
+// main
+// --------------------------------------------------
 func main() {
 	_ = godotenv.Load()
 
@@ -64,40 +71,50 @@ func main() {
 		log.Fatal("DISCORD_TOKEN or TELEGRAM_TOKEN not set in environment")
 	}
 
+	// load config or create new
 	if err := loadConfig(); err != nil {
-		log.Printf("⚠️ Could not load %s: %v. Creating new.", configPath, err)
-		if err := saveConfig(); err != nil {
-			log.Fatalf("❌ Could not create %s: %v", configPath, err)
-		}
+		log.Printf("⚠️  Could not load %s: %v — creating new", configPath, err)
+		saveConfig()
+	}
+	if config.UserMap == nil {
+		config.UserMap = make(map[string]string)
 	}
 
+	// Telegram bot
 	tgBot, err := tgbotapi.NewBotAPI(telegramToken)
 	if err != nil {
 		log.Fatalf("Telegram init error: %v", err)
 	}
-	log.Printf("Telegram bot: %s", tgBot.Self.UserName)
+	log.Printf("TG bot: @%s", tgBot.Self.UserName)
 
+	// Discord session
 	dg, err := discordgo.New("Bot " + discordToken)
 	if err != nil {
 		log.Fatalf("Discord session error: %v", err)
 	}
 	dg.Identify.Intents = discordgo.IntentsGuildMessages | discordgo.IntentsMessageContent
 
+	//--------------------------------------------------
+	// Discord → Telegram
+	//--------------------------------------------------
 	dg.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
 		if m.Author.Bot {
 			return
 		}
 
 		content := strings.TrimSpace(m.Content)
+
+		// /syn command binds channel
 		if strings.HasPrefix(strings.ToLower(content), "/syn") {
 			configMu.Lock()
 			config.DiscordChannelID = m.ChannelID
 			configMu.Unlock()
 			saveConfig()
-			s.ChannelMessageSend(m.ChannelID, "✅ Discord channel registered: "+m.ChannelID)
+			s.ChannelMessageSend(m.ChannelID, "✅ Discord channel registered")
 			return
 		}
 
+		// ensure binding
 		configMu.Lock()
 		dCh := config.DiscordChannelID
 		tCh := config.TelegramChatID
@@ -106,85 +123,69 @@ func main() {
 			return
 		}
 
+		// threads filter
 		channel, err := s.Channel(m.ChannelID)
 		if err != nil {
 			return
 		}
-		isThread := channel.Type == discordgo.ChannelTypeGuildPublicThread ||
-			channel.Type == discordgo.ChannelTypeGuildPrivateThread ||
-			channel.Type == discordgo.ChannelTypeGuildNewsThread
-
-		if !isThread && m.ChannelID != dCh {
-			return
-		}
-		if isThread && channel.ParentID != dCh {
+		isThread := channel.Type == discordgo.ChannelTypeGuildPublicThread || channel.Type == discordgo.ChannelTypeGuildPrivateThread || channel.Type == discordgo.ChannelTypeGuildNewsThread
+		if (!isThread && m.ChannelID != dCh) || (isThread && channel.ParentID != dCh) {
 			return
 		}
 
-		username := m.Author.Username
-		globalName := m.Author.GlobalName
+		// display name
 		member, _ := s.GuildMember(m.GuildID, m.Author.ID)
-		nick := ""
-		if member != nil {
-			nick = member.Nick
-		}
-		displayName := nick
-		if displayName == "" {
-			displayName = globalName
-		}
-		if displayName == "" {
-			displayName = username
-		}
+		displayName := firstNonEmpty(member.Nick, m.Author.GlobalName, m.Author.Username)
 
 		configMu.Lock()
-		tgNick := config.UserMap[displayName]
+		tgHandle := config.UserMap[displayName] // may be "@user"
 		configMu.Unlock()
 
-		threadInfo := ""
+		prefix := ""
 		if isThread {
-			threadInfo = "[Thread: " + channel.Name + "] "
+			prefix = "[Thread: " + channel.Name + "] "
+		}
+		body := "*" + displayName + "*: " + prefix + content
+		if tgHandle != "" {
+			body += " " + tgHandle
 		}
 
-		raw := "*" + displayName + "*: " + threadInfo + m.Content
-		if tgNick != "" {
-			raw += "  " + tgNick
-		}
+		msgCfg := tgbotapi.NewMessage(tCh, body)
+		msgCfg.ParseMode = "Markdown"
 
-		var tgMsg tgbotapi.Message
 		if m.MessageReference != nil {
-			key := m.ChannelID + ":" + m.MessageReference.MessageID
+			key := m.MessageReference.ChannelID + ":" + m.MessageReference.MessageID
 			bridgeMappingsMutex.Lock()
-			ref, ok := discordToTelegram[key]
-			bridgeMappingsMutex.Unlock()
-			if ok {
-				msg := tgbotapi.NewMessage(tCh, raw)
-				msg.ReplyToMessageID = ref
-				tgMsg, _ = tgBot.Send(msg)
-			} else {
-				tgMsg, _ = tgBot.Send(tgbotapi.NewMessage(tCh, raw))
+			if tgID, ok := discordToTelegram[key]; ok {
+				msgCfg.ReplyToMessageID = tgID
 			}
-		} else {
-			tgMsg, _ = tgBot.Send(tgbotapi.NewMessage(tCh, raw))
+			bridgeMappingsMutex.Unlock()
 		}
 
-		if tgMsg.MessageID != 0 {
-			key := m.ChannelID + ":" + m.ID
-			bridgeMappingsMutex.Lock()
-			discordToTelegram[key] = tgMsg.MessageID
-			bridgeMappingsMutex.Unlock()
+		tgMsg, err := tgBot.Send(msgCfg)
+		if err != nil {
+			log.Printf("Error sending to TG: %v", err)
+			return
 		}
+
+		// store mappings both ways
+		key := m.ChannelID + ":" + m.ID
+		bridgeMappingsMutex.Lock()
+		discordToTelegram[key] = tgMsg.MessageID
+		telegramToDiscord[tgMsg.MessageID] = MessageRef{ChannelID: m.ChannelID, MessageID: m.ID}
+		bridgeMappingsMutex.Unlock()
 	})
 
 	if err := dg.Open(); err != nil {
-		log.Fatalf("Could not connect to Discord: %v", err)
+		log.Fatalf("Cannot connect to Discord: %v", err)
 	}
 	defer dg.Close()
-
 	log.Println("Discord connected…")
 
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-	updates, _ := tgBot.GetUpdatesChan(u)
+	//--------------------------------------------------
+	// Telegram → Discord
+	//--------------------------------------------------
+	updates := tgBot.GetUpdatesChan(tgbotapi.UpdateConfig{Timeout: 60})
 
 	for update := range updates {
 		if update.Message == nil {
@@ -193,15 +194,17 @@ func main() {
 		text := strings.TrimSpace(update.Message.Text)
 		chatID := update.Message.Chat.ID
 
+		// /ack binds TG chat
 		if strings.HasPrefix(strings.ToLower(text), "/ack") {
 			configMu.Lock()
 			config.TelegramChatID = chatID
 			configMu.Unlock()
 			saveConfig()
-			tgBot.Send(tgbotapi.NewMessage(chatID, "✅ Telegram chat registered: "+strconv.FormatInt(chatID, 10)))
+			tgBot.Send(tgbotapi.NewMessage(chatID, "✅ Telegram chat registered"))
 			continue
 		}
 
+		// ensure bound chat
 		configMu.Lock()
 		dCh := config.DiscordChannelID
 		tCh := config.TelegramChatID
@@ -210,20 +213,72 @@ func main() {
 			continue
 		}
 
+		// get TG handle
+		tgHandle := ""
+		if update.Message.From != nil {
+			if update.Message.From.UserName != "" {
+				tgHandle = "@" + update.Message.From.UserName
+			} else {
+				tgHandle = update.Message.From.FirstName
+			}
+		}
+
+		// map to Discord display
+		discordName := tgHandle
+		configMu.Lock()
+		for dName, handle := range config.UserMap {
+			if handle == tgHandle {
+				discordName = dName
+				break
+			}
+		}
+		configMu.Unlock()
+
+		formatted := "**" + discordName + "**: " + text
+
+		// handle replies (including self‑reply chains)
 		if update.Message.ReplyToMessage != nil {
-			prevID := update.Message.ReplyToMessage.MessageID
+			origID := update.Message.ReplyToMessage.MessageID
 			bridgeMappingsMutex.Lock()
-			ref := telegramToDiscord[strconv.Itoa(prevID)]
+			ref, ok := telegramToDiscord[origID]
 			bridgeMappingsMutex.Unlock()
-			dg.ChannelMessageSendReply(ref.ChannelID, text, &discordgo.MessageReference{
-				MessageID: ref.MessageID,
-				ChannelID: ref.ChannelID,
-			})
-		} else {
-			dsMsg, _ := dg.ChannelMessageSend(dCh, text)
-			bridgeMappingsMutex.Lock()
-			telegramToDiscord[dsMsg.ID] = MessageRef{ChannelID: dCh, MessageID: dsMsg.ID}
-			bridgeMappingsMutex.Unlock()
+			if ok {
+				sentMsg, err := dg.ChannelMessageSendReply(
+					ref.ChannelID,
+					formatted,
+					&discordgo.MessageReference{MessageID: ref.MessageID, ChannelID: ref.ChannelID},
+				)
+				if err != nil {
+					log.Printf("Error sending reply to Discord: %v", err)
+				} else {
+					bridgeMappingsMutex.Lock()
+					telegramToDiscord[update.Message.MessageID] = MessageRef{ChannelID: sentMsg.ChannelID, MessageID: sentMsg.ID}
+					bridgeMappingsMutex.Unlock()
+				}
+				continue
+			}
+		}
+
+		// normal forward
+		dsMsg, err := dg.ChannelMessageSend(dCh, formatted)
+		if err != nil {
+			log.Printf("Error sending to Discord: %v", err)
+			continue
+		}
+		bridgeMappingsMutex.Lock()
+		telegramToDiscord[update.Message.MessageID] = MessageRef{ChannelID: dCh, MessageID: dsMsg.ID}
+		bridgeMappingsMutex.Unlock()
+	}
+}
+
+// --------------------------------------------------
+// util
+// --------------------------------------------------
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
 		}
 	}
+	return ""
 }
